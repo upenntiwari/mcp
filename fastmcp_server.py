@@ -1,159 +1,142 @@
-from __future__ import annotations
+### Directory layout (summary):
+#
+# ├── main.py
+# ├── config/settings.py
+# ├── routes/rag.py
+# ├── services/rag_agent.py
+# ├── utils/logger.py
+# ├── utils/cursor.py
 
-"""mcp_server.py
-=================
-Minimal Model Context Protocol (MCP) server with API‑level tracing and
-Cursor‑ID support, ready to plug into a LangGraph‑powered RAG pipeline.
+# -----------------------------
+# FILE: main.py
 
-❯  Development:
-    uvicorn mcp_server:app --reload
-
-❯  Production (Docker/VM):
-    uvicorn mcp_server:app --host 0.0.0.0 --port 8000
-
-Environment variables
----------------------
-- OPENAI_API_KEY (if your RAG agent needs it)
-- MCP_LOG_DIR       optional, default "logs/"
-
-Replace the stubbed `rag_agent()` with your own LangGraph chain or any async
-function that returns `(answer: str, docs: list[str])`.
-"""
-
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+import uvicorn
 import asyncio
-import logging
-import os
-import time
-import uuid
-from datetime import datetime
-from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from config.settings import settings
+from utils.logger import log
+from utils.cursor import attach_cursor_id
+from routes.rag import router as rag_router
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
-LOG_DIR = os.getenv("MCP_LOG_DIR", "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+logger = log.get_logger()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.join(LOG_DIR, "mcp_server.log")),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger("mcp")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting token and tracing services...")
+    # Placeholder for background services (token refresh, telemetry, etc.)
+    yield
+    logger.info("Shutting down background services...")
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
 
-def generate_cursor(step: str) -> str:
-    """Return a globally‑unique cursor ID such as `query_20250622T184512123Z_a1b2c3d4`."""
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
-    return f"{step}_{ts}_{uuid.uuid4().hex[:8]}"
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-class QueryRequest(BaseModel):
-    query: str = Field(..., description="Natural‑language question or prompt")
-    top_k: int = Field(3, ge=1, description="Number of passages to retrieve")
-
-class QueryResponse(BaseModel):
-    cursor_id: str
-    answer: str
-    docs: List[str]
-    latency_ms: int
-
-# ---------------------------------------------------------------------------
-# RAG agent stub – plug in your LangGraph chain here
-# ---------------------------------------------------------------------------
-
-async def rag_agent(query: str, top_k: int) -> tuple[str, List[str]]:
-    """Stubbed async RAG agent.
-
-    Replace with: `return await my_chain.arun({"query": query, "top_k": top_k})`
-    """
-    await asyncio.sleep(0.05)  # simulate network/compute latency
-    return "Stub answer – replace with real RAG output", [f"doc {i}" for i in range(1, top_k + 1)]
-
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="MCP Server with API Tracking",
-    version="0.1.0",
-    description="Serves RAG answers and exposes Cursor‑ID‑based tracing.",
-)
-
-@app.middleware("http")
-async def tracing_middleware(request: Request, call_next):
-    cursor_id = generate_cursor("request")
-    request.state.cursor_id = cursor_id
-    start = time.perf_counter()
-
-    logger.info(f"{cursor_id} | IN  | {request.method} {request.url.path}")
-    try:
-        response = await call_next(request)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception(f"{cursor_id} | ERR | {exc}")
-        raise
-
-    duration_ms = (time.perf_counter() - start) * 1000
-    response.headers["X-Process-Time-ms"] = f"{duration_ms:.2f}"
-    response.headers["X-Cursor-ID"] = cursor_id
-    logger.info(
-        f"{cursor_id} | OUT | status={response.status_code} | {duration_ms:.2f}ms",
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="RAG Agent with FastMCP",
+        description="Refactored RAG agent using FastAPI MCP pattern",
+        version="1.0.0",
+        lifespan=lifespan,
     )
-    return response
+
+    app.middleware("http")(attach_cursor_id)
+    app.include_router(rag_router, prefix="/rag", tags=["rag"])
+    return app
 
 
-@app.get("/health", tags=["Utility"])
-async def health():
-    """Liveness endpoint for load‑balancers and monitoring."""
-    return {"status": "ok", "utc": datetime.utcnow().isoformat()}
-
-
-@app.post("/query", response_model=QueryResponse, tags=["RAG"])
-async def query_endpoint(payload: QueryRequest):
-    cursor_id = generate_cursor("query")
-    logger.info(f"{cursor_id} | query='{payload.query}' | top_k={payload.top_k}")
-
-    start = time.perf_counter()
-    try:
-        answer, docs = await rag_agent(payload.query, payload.top_k)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception(f"{cursor_id} | rag_agent failed: {exc}")
-        raise HTTPException(status_code=500, detail="RAG agent failure") from exc
-
-    latency_ms = int((time.perf_counter() - start) * 1000)
-    logger.info(f"{cursor_id} | success | latency_ms={latency_ms}")
-    return QueryResponse(cursor_id=cursor_id, answer=answer, docs=docs, latency_ms=latency_ms)
-
-
-@app.get("/trace/{cursor_id}", tags=["Tracing"])
-async def trace_endpoint(cursor_id: str):
-    """Return all log lines that contain the requested Cursor ID."""
-    log_path = os.path.join(LOG_DIR, "mcp_server.log")
-    if not os.path.exists(log_path):
-        raise HTTPException(status_code=404, detail="Log file not found")
-
-    with open(log_path, "r", encoding="utf-8") as fh:
-        lines = [line.strip() for line in fh if cursor_id in line]
-
-    if not lines:
-        raise HTTPException(status_code=404, detail="Cursor ID not found in logs")
-
-    return {"cursor_id": cursor_id, "events": lines}
-
+app = create_app()
 
 if __name__ == "__main__":
-    import uvicorn
+    logger.info(f"Starting server on {settings.HOST}:{settings.PORT}")
+    uvicorn.run(
+        "main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        log_level="info"
+    )
 
-    uvicorn.run("mcp_server:app", host="0.0.0.0", port=8000, reload=True)
+# -----------------------------
+# FILE: config/settings.py
+
+import os
+from pydantic import BaseSettings
+
+class Settings(BaseSettings):
+    HOST: str = os.getenv("HOST", "0.0.0.0")
+    PORT: int = int(os.getenv("PORT", 8080))
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info")
+
+settings = Settings()
+
+# -----------------------------
+# FILE: routes/rag.py
+
+from fastapi import APIRouter, Request, Depends
+from services.rag_agent import rag_chat_handler
+
+router = APIRouter()
+
+@router.post("/query")
+async def rag_query(request: Request):
+    return await rag_chat_handler(request)
+
+# -----------------------------
+# FILE: services/rag_agent.py
+
+from fastapi import Request
+from utils.logger import log
+
+logger = log.get_logger()
+
+async def rag_chat_handler(request: Request):
+    try:
+        body = await request.json()
+        query = body.get("query")
+
+        logger.info(f"Received query: {query[:100]}")
+
+        # Stubbed logic (integrate with your RAG agent here)
+        response = {
+            "answer": f"Stub response for: {query}",
+            "source": "knowledge_base",
+            "trace_id": request.state.cursor_id
+        }
+        return response
+
+    except Exception as e:
+        logger.error(f"Error processing RAG request: {str(e)}")
+        return {"error": str(e)}
+
+# -----------------------------
+# FILE: utils/logger.py
+
+import logging
+import sys
+
+class Logger:
+    @staticmethod
+    def get_logger(name="app"):
+        logger = logging.getLogger(name)
+        if not logger.hasHandlers():
+            logger.setLevel(logging.INFO)
+            handler = logging.StreamHandler(sys.stdout)
+            formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        return logger
+
+log = Logger()
+
+# -----------------------------
+# FILE: utils/cursor.py
+
+import uuid
+from starlette.requests import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+
+async def attach_cursor_id(request: Request, call_next):
+    cursor_id = str(uuid.uuid4())
+    request.state.cursor_id = cursor_id
+    response = await call_next(request)
+    response.headers["X-Cursor-ID"] = cursor_id
+    return response
+
